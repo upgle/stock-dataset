@@ -23,9 +23,12 @@ daily = (df_min.groupby('일자')
               low=('저가','min'),  close=('종가','last'), vol=('거래량','sum'))
          .reset_index()
          .sort_values('일자').reset_index(drop=True))
-daily['date']    = pd.to_datetime(daily['일자'].astype(str), format='%Y%m%d')
-daily['weekday'] = daily['date'].dt.weekday         # 0=월 … 4=금
+daily['date']       = pd.to_datetime(daily['일자'].astype(str), format='%Y%m%d')
+daily['weekday']    = daily['date'].dt.weekday         # 0=월 … 4=금
 daily['prev_range'] = (daily['high'] - daily['low']).shift(1)
+daily['prev_close'] = daily['close'].shift(1)
+daily['gap_down']   = daily['open'] < daily['prev_close']   # 당일 시가 < 전일 종가
+daily['gap_pct']    = (daily['open'] - daily['prev_close']) / daily['prev_close'] * 100
 daily['next_open']  = daily['open'].shift(-1)
 
 # 이동평균 · ATR
@@ -90,7 +93,7 @@ def add_rp(df, window):
 def backtest(alpha=0.25, rp_thresh=0.2, rp_win=5,
              skip_thu=True, skip_wed=False, skip_fri=False,
              monday_aux=True, trend_ma=None, atr_max=None,
-             vb_cutoff=9*60+14):
+             vb_cutoff=9*60+14, rp_gap_down=False):
     d = daily.copy()
     d['rp'] = add_rp(d, rp_win)
     skip = {w for w, f in [(3,skip_thu),(2,skip_wed),(4,skip_fri)] if f}
@@ -127,7 +130,8 @@ def backtest(alpha=0.25, rp_thresh=0.2, rp_win=5,
 
             if signal is None:
                 rp_val = row['rp']
-                if not np.isnan(rp_val) and rp_val < rp_thresh:
+                gap_ok = (not rp_gap_down) or bool(row['gap_down'])
+                if not np.isnan(rp_val) and rp_val < rp_thresh and gap_ok:
                     signal, entry_px = 'rp', close_px
 
         if signal is None and monday_aux and wd == 0:
@@ -436,3 +440,145 @@ print(f"""
   ※ 단, 모든 개선안은 동일 데이터 내 최적화이므로 과적합 위험 존재.
     후반기(검증) 성과가 전반기(훈련)와 유사한지 반드시 확인할 것.
 """)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 추가 분석: RP + Gap-Down 조건
+# ══════════════════════════════════════════════════════════════════════════════
+print()
+print("=" * 72)
+print("  [RP Gap-Down 조건 분석]")
+print("  조건: 5일 RP < 0.2  +  당일 시가 < 전일 종가 (gap-down)")
+print("=" * 72)
+
+# ── 1. 전체 전략 수준 비교 ──────────────────────────────────────────────────
+t_rp_base   = backtest(rp_gap_down=False)
+t_rp_gapdn  = backtest(rp_gap_down=True)
+m_base_all  = metrics(t_rp_base)
+m_gapdn_all = metrics(t_rp_gapdn)
+
+print()
+print("  ▸ 전체 전략 비교 (VB+RP+월보조 포함)")
+print(row_str("기준 (gap-down 조건 없음)", m_base_all))
+print(row_str("RP gap-down 조건 추가",    m_gapdn_all))
+
+# ── 2. RP 신호만 분리 비교 ──────────────────────────────────────────────────
+print()
+print("  ▸ RP 신호만 분리 비교")
+
+rp_only_base  = t_rp_base[t_rp_base['signal'] == 'rp'].copy()
+rp_only_gapdn = t_rp_gapdn[t_rp_gapdn['signal'] == 'rp'].copy()
+
+m_rp_base  = metrics(rp_only_base)
+m_rp_gapdn = metrics(rp_only_gapdn)
+
+print(row_str("  RP (gap-down 없음)", m_rp_base))
+print(row_str("  RP (gap-down 있음)", m_rp_gapdn))
+
+# ── 3. RP 발생일 전수 분석 (gap-down 유무별) ──────────────────────────────
+print()
+print("  ▸ RP 조건(RP<0.2) 충족일의 gap-down 유무별 수익 분포")
+
+d_analysis = daily.copy()
+d_analysis['rp'] = add_rp(d_analysis, 5)
+
+# RP 조건 충족일 전체 추출 (목요일 스킵, warm-up 제외)
+rp_days = d_analysis[
+    (d_analysis['rp'] < 0.2) &
+    (~d_analysis['rp'].isna()) &
+    (~d_analysis['prev_close'].isna()) &
+    (~d_analysis['next_open'].isna()) &
+    (d_analysis['weekday'] != 3) &
+    (d_analysis.index >= 60)
+].copy()
+
+rp_days['raw_ret'] = (rp_days['next_open'] / rp_days['close'] - 1) * 100
+rp_days['net_ret'] = rp_days['raw_ret'] - FEE * 2 * 100
+
+gap_groups = rp_days.groupby('gap_down')
+print(f"\n  {'구분':<22} {'건수':>5} {'승률':>7} {'평균수익':>9} {'중앙값':>8} {'std':>7}")
+print("  " + "-" * 58)
+for gd, g in sorted(gap_groups, key=lambda x: x[0]):
+    label = "gap-down (시가<전종)" if gd else "gap-up/flat (시가≥전종)"
+    win   = (g['net_ret'] > 0).mean() * 100
+    avg   = g['net_ret'].mean()
+    med   = g['net_ret'].median()
+    std   = g['net_ret'].std()
+    print(f"  {label:<22} {len(g):>5}건  {win:>6.1f}%  {avg:>+8.3f}%  {med:>+7.3f}%  {std:>6.3f}%")
+
+# ── 4. gap 크기별 수익 분포 ─────────────────────────────────────────────────
+print()
+print("  ▸ RP 조건 충족일 — gap 크기별 평균 수익 (순수 RP 발생일)")
+gap_bins = [(-99, -2, "갭하락 -2%↓"),
+            (-2,  -1, "갭하락 -1~-2%"),
+            (-1, -0.3,"갭하락 -0.3~-1%"),
+            (-0.3, 0, "갭하락 0~-0.3%"),
+            (0,   99, "갭상승/보합 0%↑")]
+print(f"\n  {'구분':<22} {'건수':>5} {'승률':>7} {'평균수익':>9}")
+print("  " + "-" * 47)
+for lo, hi, label in gap_bins:
+    sub = rp_days[(rp_days['gap_pct'] >= lo) & (rp_days['gap_pct'] < hi)]
+    if sub.empty:
+        continue
+    win = (sub['net_ret'] > 0).mean() * 100
+    avg = sub['net_ret'].mean()
+    print(f"  {label:<22} {len(sub):>5}건  {win:>6.1f}%  {avg:>+8.3f}%")
+
+# ── 5. 연도별 gap-down 효과 ─────────────────────────────────────────────────
+print()
+print("  ▸ 연도별 RP 신호 성과 (gap-down 유무)")
+rp_days['year'] = rp_days['date'].dt.year
+for yr, g in rp_days.groupby('year'):
+    gd  = g[g['gap_down']]
+    nongd = g[~g['gap_down']]
+    gd_avg  = gd['net_ret'].mean()  if len(gd)  > 0 else float('nan')
+    ng_avg  = nongd['net_ret'].mean() if len(nongd) > 0 else float('nan')
+    print(f"    {yr}:  gap-down {len(gd):>3}건 평균{gd_avg:>+6.3f}%  |  "
+          f"gap-up/flat {len(nongd):>3}건 평균{ng_avg:>+6.3f}%")
+
+# ── 6. 임계값별 gap-down 효과 비교 ─────────────────────────────────────────
+print()
+print("  ▸ RP 임계값별 gap-down 조건 효과")
+print(f"  {'RP임계':>6} {'조건':>20} {'건수':>5} {'승률':>7} {'평균':>8} {'총수익':>8} {'Sharpe':>7}")
+print("  " + "-" * 60)
+for rp_t in [0.10, 0.15, 0.20, 0.25, 0.30]:
+    for gd in [False, True]:
+        t = backtest(rp_thresh=rp_t, rp_gap_down=gd)
+        rp_sub = t[t['signal'] == 'rp']
+        if rp_sub.empty:
+            continue
+        m = metrics(rp_sub)
+        gd_label = "RP+gap-down" if gd else "RP 기준"
+        print(f"  {rp_t:>6.2f} {gd_label:>20} {m['n']:>5}건  {m['win']:>6.1f}%  "
+              f"{m['avg']:>+7.3f}%  {m['total']:>+7.1f}%  {m['sharpe']:>6.2f}")
+    print()
+
+# ── 7. 최종 권고 ────────────────────────────────────────────────────────────
+print("=" * 72)
+print("  [gap-down 조건 종합 결론]")
+print("=" * 72)
+
+# 수치 기반 결론
+gd_sub  = rp_days[rp_days['gap_down']]
+ngd_sub = rp_days[~rp_days['gap_down']]
+gd_win  = (gd_sub['net_ret'] > 0).mean() * 100
+ngd_win = (ngd_sub['net_ret'] > 0).mean() * 100
+gd_avg  = gd_sub['net_ret'].mean()
+ngd_avg = ngd_sub['net_ret'].mean()
+effect  = gd_avg - ngd_avg
+
+print(f"""
+  gap-down 있을 때  : {len(gd_sub):>3}건  승률{gd_win:.1f}%  평균{gd_avg:>+.3f}%
+  gap-down 없을 때  : {len(ngd_sub):>3}건  승률{ngd_win:.1f}%  평균{ngd_avg:>+.3f}%
+  gap-down 효과     : {effect:>+.3f}%p (양수=gap-down이 유리)
+
+  전략 수준 영향:
+    기준 전략         : 총수익{m_base_all['total']:>+7.1f}%  Sharpe{m_base_all['sharpe']:>5.2f}
+    RP gap-down 추가  : 총수익{m_gapdn_all['total']:>+7.1f}%  Sharpe{m_gapdn_all['sharpe']:>5.2f}
+    차이              : {m_gapdn_all['total']-m_base_all['total']:>+.1f}%p
+""")
+if effect > 0.1:
+    print("  → gap-down 조건이 RP 신호 품질을 유의미하게 개선합니다. 추가 권고.")
+elif effect > 0:
+    print("  → gap-down 조건이 약간 유리하나 거래 수 감소를 감안해 선택적 적용.")
+else:
+    print("  → gap-down 조건이 RP 신호를 개선하지 못합니다. 추가 불필요.")
